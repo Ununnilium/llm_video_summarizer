@@ -1,0 +1,49 @@
+[project]
+name = "video-summarizer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "faster-whisper>=1.1.1",
+    "iso-639>=0.4.5",
+    "kitoken>=0.10.1",
+    "langdetect>=1.0.9",
+    "nltk>=3.9.1",
+    "ollama>=0.4.7",
+    "pandas>=2.2.3",
+    "pyannote-audio>=3.3.2",
+    "requests>=2.32.3",
+    "tiktoken>=0.9.0",
+    "yt-dlp>=2025.2.19",
+]
+
+[project.optional-dependencies]
+dev = [
+    "notebook>=7.3.2",
+    "ipywidgets>=8.1.5",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[dependency-groups]
+dev = [
+    "py-spy>=0.4.0",
+    "ruff>=0.9.9",
+    "transformers>=4.49.0",
+]
+
+[tool-ruff]
+line-length = 119
+
