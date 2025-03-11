@@ -12,22 +12,18 @@ import warnings
 from typing import Any
 
 import langdetect
-from iso639 import languages
+import local_ffmpeg
+from iso639 import Language
 import kitoken
 import nltk
 import pandas as pd
 import requests
 import tiktoken
+import torch
 import yt_dlp
 
 logger = logging.getLogger(__name__)
 _file_dir = Path(os.path.dirname(os.path.realpath(__file__)))
-
-try:
-    _huggingface_token = os.environ["HF_TOKEN"]
-except KeyError:
-    print("Please set the HF_TOKEN environment variable", file=sys.stderr)
-    sys.exit(1)
 
 
 try:
@@ -39,7 +35,7 @@ except LookupError:
 
 
 class VideoSummarizer:
-    _whisper_model = "large-v3"  # turbo cannot translate
+    _whisper_model = "turbo"  # turbo cannot translate, therefore consider "large-v3"
     _context_limit = 16384  # could be set higher, but often quality suffers (https://github.com/NVIDIA/RULER)
 
     def __init__(
@@ -102,7 +98,7 @@ class VideoSummarizer:
     def _get_video_title_description(self) -> tuple[str, str, str]:
         if not self._video_title_description.exists():
             self._clean_description()
-        with self._video_title_description.open() as f:
+        with self._video_title_description.open(encoding="utf-8") as f:
             video_info = json.load(f)
         return (
             video_info.get("title", ""),
@@ -112,7 +108,7 @@ class VideoSummarizer:
 
     def _get_full_transcript(self) -> list[str, str, int]:
         if self._full_transcript.exists():
-            with self._full_transcript.open() as f:
+            with self._full_transcript.open(encoding="utf-8") as f:
                 return json.load(f)
         raise FileNotFoundError(
             "Full transcript not found, run first transcription method"
@@ -120,6 +116,14 @@ class VideoSummarizer:
 
     def _download_audio(self) -> None:
         start_ts = time.time()
+        if not local_ffmpeg.check():
+            logger.info("FFmpeg not found, installing locally...")
+            success, message = local_ffmpeg.install()
+            if success:
+                logger.info(message)  # FFmpeg installed successfully
+            else:
+                logger.error(f"Error: {message}")
+                sys.exit(1)
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": os.path.splitext(self._audio_file)[0],
@@ -141,12 +145,15 @@ class VideoSummarizer:
                 "interaction",
                 "music_offtopic",
             ],
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+            },
         }
         logger.info("Downloading audio...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             if not self._video_info.exists():
                 info = ydl.extract_info(self._url, download=False)
-                with self._video_info.open("w") as f:
+                with self._video_info.open("w", encoding="utf-8") as f:
                     json.dump(info, f, ensure_ascii=False, indent=2)
             if not self._audio_file.exists():
                 ydl.download([self._url])
@@ -160,8 +167,14 @@ class VideoSummarizer:
 
         task = "translate" if translate else "transcribe"
         start_ts = time.time()
+        if torch.cuda.is_available():
+            device = "cuda"
+            compute_type = "int8_float16"
+        else:
+            device = "cpu"
+            compute_type = "int8"
         whisper_model = WhisperModel(
-            VideoSummarizer._whisper_model, device="cuda", compute_type="int8_float16"
+            VideoSummarizer._whisper_model, device=device, compute_type=compute_type
         )
         batched_model = BatchedInferencePipeline(model=whisper_model)
         with warnings.catch_warnings(action="ignore"):
@@ -176,7 +189,7 @@ class VideoSummarizer:
             lang = (
                 "english"
                 if translate
-                else languages.get(alpha2=info.language).name.lower()
+                else Language.from_part1(info.language).name.lower()
             )
         sentence_timestamps = []
         for seg in whisper_segments:
@@ -209,7 +222,7 @@ class VideoSummarizer:
                         sentence_timestamps.append(
                             (sentence_start, sentence_end, sentence)
                         )
-        with out_json.open("w") as f:
+        with out_json.open("w", encoding="utf-8") as f:
             json.dump(sentence_timestamps, f, ensure_ascii=False, indent=2)
         logger.info(
             f"Transcription finished in {timedelta(seconds=time.time() - start_ts)}"
@@ -220,20 +233,32 @@ class VideoSummarizer:
         from pyannote.audio import Pipeline
         import torch
 
+        def load_pipeline_from_pretrained() -> Pipeline:
+            path_to_config = (
+                Path(__file__).parent / "models" / "pyannote_diarization_config.yaml"
+            )
+            cwd = Path.cwd().resolve()  # store current working directory
+
+            # first .parent is the folder of the config, second .parent is the folder containing the 'models' folder
+            cd_to = path_to_config.parent.parent.resolve()
+            os.chdir(cd_to)
+            pipeline = Pipeline.from_pretrained(path_to_config)
+            os.chdir(cwd)
+            return pipeline
+
         speechbrain_logger = logging.getLogger("speechbrain")
         speechbrain_logger.setLevel(logging.WARNING)
 
         start_ts = time.time()
         with warnings.catch_warnings(action="ignore"):
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization", use_auth_token=_huggingface_token
-            )
-            pipeline.to(torch.device("cuda"))
+            pipeline = load_pipeline_from_pretrained()
+            if torch.cuda.is_available():
+                pipeline.to(torch.device("cuda"))
             diarization_result = pipeline(str(in_file_audio))  # speaker diarization
         diarization_json = []
         for s, _, speaker in diarization_result.itertracks(yield_label=True):
             diarization_json.append((s.start, s.end, speaker))
-        with out_file.open("w") as f:
+        with out_file.open("w", encoding="utf-8") as f:
             json.dump(diarization_json, f, ensure_ascii=False, indent=2)
         logger.info(
             f"Speaker diarization finished in {timedelta(seconds=time.time() - start_ts)}"
@@ -274,7 +299,7 @@ class VideoSummarizer:
             lambda x: self._count_tokens(self._model_chunks, x)
         )
         self._n_speakers = df_speakers["speaker"].nunique()
-        with self._full_transcript.open("w") as f:
+        with self._full_transcript.open("w", encoding="utf-8") as f:
             df_text_segments[["best_speaker", "text", "n_tokens"]].to_json(
                 f, orient="values", indent=2, force_ascii=False
             )
@@ -302,9 +327,9 @@ class VideoSummarizer:
             p.join()
             if p.exitcode != 0:
                 raise RuntimeError("Transcription or diarization failed")
-        with self._transcript.open() as f:
+        with self._transcript.open(encoding="utf-8") as f:
             transcript_res = json.load(f)
-        with self._diarization.open() as f:
+        with self._diarization.open(encoding="utf-8") as f:
             diarization_res = json.load(f)
         self._combine_transcript_diarization(transcript_res, diarization_res)
         logger.info(
@@ -312,8 +337,7 @@ class VideoSummarizer:
         )
 
     def _create_text_from_list(
-        self,
-        sentence_list: list[list[str, str, int] | tuple[str, str, int]],
+        self, sentence_list: list[list[str, str, int] | tuple[str, str, int]]
     ) -> str:
         if self._n_speakers == 1:
             return "\n".join([f"\n{text.lstrip()}" for _, text, _ in sentence_list])
@@ -335,7 +359,7 @@ class VideoSummarizer:
         all_segments = []
         current_text = []
         sum_tokens = 0
-        with self._full_transcript.open() as f:
+        with self._full_transcript.open(encoding="utf-8") as f:
             full_transcript = json.load(f)
         for i, (speaker, text, n_tokens) in enumerate(full_transcript):
             sum_tokens += n_tokens
@@ -350,7 +374,7 @@ class VideoSummarizer:
 
     @staticmethod
     def _trim_to_full_sentence(string: str) -> str:
-        lang = languages.get(alpha2=langdetect.detect(string)).name.lower()
+        lang = Language.from_part1(langdetect.detect(string)).name.lower()
         sentences = nltk.sent_tokenize(string, language=lang)
         return " ".join(sentences[1:])
 
@@ -362,7 +386,7 @@ class VideoSummarizer:
         if self._video_title_description.exists():
             return
 
-        with self._video_info.open() as f:
+        with self._video_info.open(encoding="utf-8") as f:
             video_info = json.load(f)
 
         system = """You are a Large Language Model (LLM) to clean up YouTube video descriptions from irrelevant 
@@ -380,9 +404,17 @@ class VideoSummarizer:
             self._model_description,
             output_tokens=1000,
         )
-        with self._video_title_description.open('w') as f:
-            json.dump({'title': video_info['title'], 'description': description, 'channel': video_info['uploader']},
-                      f, ensure_ascii=False, indent=2)
+        with self._video_title_description.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "title": video_info["title"],
+                    "description": description,
+                    "channel": video_info["uploader"],
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
 
     def _summarize_chunks(self) -> None:
         max_output_tokens = 2000
@@ -456,11 +488,11 @@ class VideoSummarizer:
             )
             summarized_chunks.append(chunk_sum)
             previous_summary = " ".join(summarized_chunks)
-        with self._summarized_chunks.open("w") as f:
+        with self._summarized_chunks.open("w", encoding="utf-8") as f:
             json.dump(summarized_chunks, f, ensure_ascii=False, indent=2)
 
     def _create_article_from_chunks(self) -> None:
-        with self._summarized_chunks.open() as f:
+        with self._summarized_chunks.open(encoding="utf-8") as f:
             summarized_chunks = json.load(f)
         combined_content = "\n\n".join(s for i, s in enumerate(summarized_chunks))
         title, description, channel = self._get_video_title_description()
@@ -499,7 +531,7 @@ class VideoSummarizer:
         article = self._call_llm(
             "Article", system, user_prompt, self._model_article, max_output_tokens
         )
-        with self.article.open("w") as f:
+        with self.article.open("w", encoding="utf-8") as f:
             f.write(article)
 
     def _call_llm(
@@ -547,8 +579,12 @@ class VideoSummarizer:
         )
 
         # output for debugging/analysis only
-        clean_name = "".join(c for c in name.lower().replace(" ", "_") if c.isalnum() or c in "._- ")
-        with (self._out_dir / f"{clean_name}_llm_call.txt").open("w") as f:
+        clean_name = "".join(
+            c for c in name.lower().replace(" ", "_") if c.isalnum() or c in "._- "
+        )
+        with (self._out_dir / f"{clean_name}_llm_call.txt").open(
+            "w", encoding="utf-8"
+        ) as f:
             f.write(
                 f"# System Prompt ({system_prompt_tokens} tokens) #\n"
                 f"{system_prompt}\n\n# User Prompt ({user_prompt_tokens} tokens)#\n"
@@ -570,11 +606,17 @@ class VideoSummarizer:
         resp = requests.post("http://localhost:11434/api/show", json={"model": model})
         if resp.status_code == 404:
             logger.info(f"Pulling model {model}...")
-            resp2 = requests.post("http://localhost:11434/api/pull", json={"model": model, "stream": False})
+            resp2 = requests.post(
+                "http://localhost:11434/api/pull",
+                json={"model": model, "stream": False},
+            )
             if resp2 != 200:
-                raise RuntimeError(f"Could not pull model {model} ({resp2.text}), please try manually "
-                                   f"'ollama pull {model}'")
-            resp = requests.post("http://localhost:11434/api/show", json={"model": model})
+                raise RuntimeError(
+                    f"Could not pull model {model} ({resp2.text}), please try manually 'ollama pull {model}'"
+                )
+            resp = requests.post(
+                "http://localhost:11434/api/show", json={"model": model}
+            )
         resp.raise_for_status()
         model_info = resp.json()
         return model_info["model_info"][
@@ -591,7 +633,7 @@ class VideoSummarizer:
 
 def main() -> None:
     def _clean_model_name(name: str) -> str:
-        return name.rsplit("/", 1)[-1]
+        return name.replace(":", "@").rsplit("/", 1)[-1]
 
     logger.setLevel(logging.INFO)
     logger.addHandler(logging.StreamHandler())

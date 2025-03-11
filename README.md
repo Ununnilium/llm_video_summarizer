@@ -1,5 +1,8 @@
 # Create Articles from YouTube Videos
 
+This application uses Faster Whisper, pyannote-audio and an LLM running with Ollama to summarize YouTube videos.
+It creates a summary of the video parts and an article from the summaries.
+
 1. Install Ollama on your computer: https://ollama.com/download
    For an Intel GPU, you can use [this version](https://github.com/intel/ipex-llm/blob/main/docs/mddocs/Quickstart/ollama_portable_zip_quickstart.md)
 2. This application uses pyannote-audio. You have to create a Huggingface account, accept the license agreement 

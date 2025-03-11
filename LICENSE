@@ -1,4 +1,6 @@
-This applies to all files except the JSON files in the tokenizer directory.
+The following ISC license applies to all files except:
+- the JSON files in the tokenizer directory
+- The models in the models directory
 
 Copyright (c) 2025, Fabian Heller <heller.fabian@gmail.com>
 
