@@ -1,0 +1,44 @@
+{
+  "gemma3-12b": {
+    "name": "gemma3:12b",
+    "api": "ollama",
+    "base_url": "http://localhost:11434/api",
+    "max_context_len": 131072,
+    "tokenizer": "gemma3"
+  },
+  "gemma3-27b": {
+    "name": "gemma3:27b",
+    "api": "ollama",
+    "base_url": "http://localhost:11434/api",
+    "max_context_len": 131072,
+    "tokenizer": "gemma3"
+  },
+    "gemma3-4b": {
+    "name": "gemma3:4b-it-q8_0",
+    "api": "ollama",
+    "base_url": "http://localhost:11434/api",
+    "max_context_len": 131072,
+    "tokenizer": "gemma3"
+  },
+  "mistral-small": {
+    "name": "mistral-small:24b-instruct-2501-q4_K_M",
+    "api": "ollama",
+    "base_url": "http://localhost:11434/api",
+    "max_context_len": 16384,
+    "tokenizer": "tekken"
+  },
+  "phi4": {
+    "name": "phi4:14b-q4_K_M",
+    "api": "ollama",
+    "base_url": "http://localhost:11434/api",
+    "max_context_len": 16384,
+    "tokenizer": "phi4"
+  },
+  "granite3.2": {
+    "name": "granite3.2:8b-instruct-q4_K_M",
+    "api": "ollama",
+    "base_url": "http://localhost:11434/api",
+    "max_context_len": 16384,
+    "tokenizer": "granite3.2"
+  }
+}

@@ -1,5 +1,4 @@
 import argparse
-import functools
 import json
 import logging
 import os
@@ -14,15 +13,14 @@ from typing import Any
 import langdetect
 import local_ffmpeg
 from iso639 import Language
-import kitoken
 import nltk
 import pandas as pd
-import requests
-import tiktoken
 import torch
 import yt_dlp
 
-logger = logging.getLogger(__name__)
+import llm_provider
+
+logger = logging.getLogger("video_summarizer")
 _file_dir = Path(os.path.dirname(os.path.realpath(__file__)))
 
 
@@ -62,9 +60,15 @@ class VideoSummarizer:
         self._out_dir.mkdir(exist_ok=True)
         self._url = url
         self._translate = translate
-        self._model_chunks = model_chunks
-        self._model_article = model_article
-        self._model_description = model_description
+        self._model_chunks = llm_provider.LlmProvider.get_llm_provider(
+            model_chunks, self._out_dir
+        )
+        self._model_article = llm_provider.LlmProvider.get_llm_provider(
+            model_article, self._out_dir
+        )
+        self._model_description = llm_provider.LlmProvider.get_llm_provider(
+            model_description, self._out_dir
+        )
         self._audio_file: Path = self._out_dir / "audio.opus"
         self._video_info: Path = self._out_dir / "video_info.json"
         self._video_title_description = self._out_dir / "video_title_description.json"
@@ -76,24 +80,6 @@ class VideoSummarizer:
         self._text: None | str = None
         self._n_speakers: None | int = None
         self._summarization: str | None = None
-
-    @staticmethod
-    @functools.cache
-    def _get_encoding(model: str) -> tiktoken.Encoding | kitoken.Kitoken:
-        if model.startswith("mistral-"):
-            return kitoken.Kitoken.from_tekken_file(
-                str(_file_dir / "tokenizer" / "tekken.json")
-            )
-        else:
-            tokenizer_path = _file_dir / "tokenizer" / f"{model.split(':')[0]}.json"
-            if tokenizer_path.exists():
-                logger.debug(f"Using custom tokenizer for {model}...")
-                return kitoken.Kitoken.from_tokenizers_file(str(tokenizer_path))
-        return tiktoken.get_encoding("cl100k_base")
-
-    @staticmethod
-    def _count_tokens(model: str, string: str) -> int:
-        return len(VideoSummarizer._get_encoding(model).encode(string))
 
     def _get_video_title_description(self) -> tuple[str, str, str]:
         if not self._video_title_description.exists():
@@ -116,7 +102,7 @@ class VideoSummarizer:
 
     def _download_audio(self) -> None:
         start_ts = time.time()
-        if not local_ffmpeg.check():
+        if not local_ffmpeg.is_installed():
             logger.info("FFmpeg not found, installing locally...")
             success, message = local_ffmpeg.install()
             if success:
@@ -296,7 +282,7 @@ class VideoSummarizer:
             lambda row: find_best_speaker(row, df_speakers), axis=1
         )
         df_text_segments["n_tokens"] = df_text_segments.text.apply(
-            lambda x: self._count_tokens(self._model_chunks, x)
+            self._model_chunks.count_tokens
         )
         self._n_speakers = df_speakers["speaker"].nunique()
         with self._full_transcript.open("w", encoding="utf-8") as f:
@@ -397,11 +383,10 @@ class VideoSummarizer:
         {video_info["description"]}
         ```
         '''
-        description = self._call_llm(
+        description = self._model_description.call_llm(
             "Clean video description",
             system,
             user_content,
-            self._model_description,
             output_tokens=1000,
         )
         with self._video_title_description.open("w", encoding="utf-8") as f:
@@ -444,34 +429,30 @@ class VideoSummarizer:
             "It should only include the description, do not provide any further "
             "explanation and don't create any titles. As context, use the provided descriptions of the previous "
             "segments (if available), but take care to not repeat anything already described there. Do not repeat "
-            "yourself."
+            "yourself. Your output should not exceed 2000 tokens (or around 10000 characters or 1500 words)."
         )
         previous_summary = ""
         summarized_chunks = []
 
         for i, chunk in enumerate(text_chunks):
             # Calculate available tokens for previous summary
-            system_tokens = self._count_tokens(self._model_chunks, system_content)
+            system_tokens = self._model_chunks.count_tokens(system_content)
             user_content = (
                 f"Create the description of the following video transcript segment number {i + 1} of "
                 f"{len(text_chunks)}:\n{chunk}"
             )
-            user_prompt_tokens = self._count_tokens(self._model_chunks, user_content)
+            user_prompt_tokens = self._model_chunks.count_tokens(user_content)
             available_tokens = (
                 self._context_limit
                 - max_output_tokens
                 - system_tokens
                 - user_prompt_tokens
             )
-            previous_summary_tokens = self._count_tokens(
-                self._model_chunks, previous_summary
-            )
+            previous_summary_tokens = self._model_chunks.count_tokens(previous_summary)
 
             if previous_summary_tokens > available_tokens:
-                encoded_previous = self._get_encoding(self._model_chunks).encode(
-                    previous_summary
-                )
-                trimmed_previous = self._get_encoding(self._model_chunks).decode(
+                encoded_previous = self._model_chunks.encode(previous_summary)
+                trimmed_previous = self._model_chunks.decode(
                     encoded_previous[-available_tokens:]
                 )
                 previous_summary = self._trim_to_full_sentence(trimmed_previous)
@@ -479,11 +460,10 @@ class VideoSummarizer:
             system = (
                 f"{system_content}\n\n## Previous descriptions ##\n{previous_summary}"
             )
-            chunk_sum = self._call_llm(
+            chunk_sum = self._model_chunks.call_llm(
                 f"Chunk {i + 1}/{len(text_chunks)}",
                 system,
                 user_content,
-                self._model_chunks,
                 max_output_tokens,
             )
             summarized_chunks.append(chunk_sum)
@@ -501,7 +481,7 @@ class VideoSummarizer:
             f"\n{title}\n\n## Official video online description ##\n{description}\n\n"
             f"## Video description ##\n{combined_content}"
         )
-        user_prompt_tokens = self._count_tokens(self._model_article, user_prompt)
+        user_prompt_tokens = self._model_article.count_tokens(user_prompt)
         max_output_tokens = round(user_prompt_tokens * 1.2)
         if self._n_speakers > 1:
             speaker_info = (
@@ -528,100 +508,19 @@ class VideoSummarizer:
             "Do not add your own explanations or disclaimers (the only output should be the article) and make "
             "sure to not repeat yourself."
         )
-        article = self._call_llm(
-            "Article", system, user_prompt, self._model_article, max_output_tokens
+        article = self._model_article.call_llm(
+            "Article", system, user_prompt, max_output_tokens
         )
         with self.article.open("w", encoding="utf-8") as f:
             f.write(article)
 
-    def _call_llm(
-        self,
-        name: str,
-        system_prompt: str,
-        user_prompt: str,
-        model: str,
-        output_tokens: int,
-    ) -> str:
-        system_prompt_tokens = self._count_tokens(model, system_prompt)
-        user_prompt_tokens = self._count_tokens(model, user_prompt)
-        ctx_len = output_tokens + system_prompt_tokens + user_prompt_tokens
-        model_ctx_len = self._get_model_ctx_len(model)
-        if ctx_len > model_ctx_len:
-            logger.warning(
-                f"Model's context length of {model_ctx_len} too short, needed {ctx_len}..."
-            )
-            ctx_len = model_ctx_len
-        logger.info(f"Calling {model} for '{name}' (ctx_len={ctx_len})...")
-        start_ts = time.time()
-        data = {
-            "model": model,
-            "stream": False,
-            "keep_alive": 5,
-            "system": system_prompt,
-            "options": {
-                "num_ctx": ctx_len,
-                "num_batch": 512,  # smaller num_batch lowers GPU memory usage and performance
-            },
-            "prompt": user_prompt,
-        }
-        resp = requests.post("http://localhost:11434/api/generate", json=data)
-        while resp.status_code == 500 and data["options"]["num_batch"] > 1:
-            data["options"]["num_batch"] -= 64
-            logger.warning(f"Reducing num_batch to {data['options']['num_batch']}...")
-            resp = requests.post("http://localhost:11434/api/generate", json=data)
-        resp.raise_for_status()
-        response = resp.json()
-        logger.info(
-            f"Calling {model} for '{name}' took {timedelta(seconds=time.time() - start_ts)}, "
-            f"{self._tokens_per_seconds(response):.1f} tokens/s, prompt tokens: {response['prompt_eval_count']} "
-            f"(estimated: {system_prompt_tokens + user_prompt_tokens}), "
-            f"response tokens: {response['eval_count']} (estimated {output_tokens})"
-        )
-
-        # output for debugging/analysis only
-        clean_name = "".join(
-            c for c in name.lower().replace(" ", "_") if c.isalnum() or c in "._- "
-        )
-        with (self._out_dir / f"{clean_name}_llm_call.txt").open(
-            "w", encoding="utf-8"
-        ) as f:
-            f.write(
-                f"# System Prompt ({system_prompt_tokens} tokens) #\n"
-                f"{system_prompt}\n\n# User Prompt ({user_prompt_tokens} tokens)#\n"
-                f"{user_prompt}\n\n"
-                f"# Response ({response['eval_count']} tokens) #\n"
-                f"{response['response']}"
-            )
-        return response["response"]
-
+    # TODO: Check if needed
     def _create_dirname(self, title: str) -> str:
         system = "You are an LLM that creates a single, short folder name (snakecase) from a video title. Don't output anything else."
         prompt = f'Video title to create folder name: "{title}"'
-        return self._call_llm(
-            "Directory name", system, prompt, self._model_description, output_tokens=100
+        return self._model_description.call_llm(
+            "Directory name", system, prompt, output_tokens=100
         )
-
-    @staticmethod
-    def _get_model_ctx_len(model: str) -> int:
-        resp = requests.post("http://localhost:11434/api/show", json={"model": model})
-        if resp.status_code == 404:
-            logger.info(f"Pulling model {model}...")
-            resp2 = requests.post(
-                "http://localhost:11434/api/pull",
-                json={"model": model, "stream": False},
-            )
-            if resp2 != 200:
-                raise RuntimeError(
-                    f"Could not pull model {model} ({resp2.text}), please try manually 'ollama pull {model}'"
-                )
-            resp = requests.post(
-                "http://localhost:11434/api/show", json={"model": model}
-            )
-        resp.raise_for_status()
-        model_info = resp.json()
-        return model_info["model_info"][
-            f"{model_info['details']['family']}.context_length"
-        ]
 
     def summarize(self) -> str:
         self._download_audio()
